@@ -1,12 +1,9 @@
-import React, { useState, useEffect } from 'react';
-import axios from 'axios';
+import React from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
-import { CheckCircle, TrendingUp } from 'lucide-react';
+import { CheckCircle } from 'lucide-react';
 import './ValidationChart.css';
 
-function ValidationChart({ apiUrl, simulationData }) {
-  const [loading, setLoading] = useState(false);
-
+function ValidationChart({ simulationData }) {
   // If no simulation data provided, show empty state
   if (!simulationData) {
     return (

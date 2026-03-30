@@ -57,15 +57,15 @@ function FileUpload({ apiUrl, onUploadSuccess }) {
     <div className="file-upload-container">
       <div className="upload-card">
         <div className="upload-hero">
-          <h2>🚀 Start Here: Upload Your Production Data</h2>
+          <h2>🚀 Part B: Upload CSV for Self-Learning Twin</h2>
           <p className="upload-tagline">
-            Watch the system discover your factory's digital twin automatically
+            Use CSV from Part A or from any external source with the same format
           </p>
         </div>
         
         <p className="upload-description">
           Upload any CSV file with CaseID, Activity, Timestamp, and Lifecycle columns.
-          The system will automatically discover the topology and distributions.
+          The system will automatically discover topology, fit distributions, and build the digital twin.
         </p>
 
         <div className="upload-button-wrapper">

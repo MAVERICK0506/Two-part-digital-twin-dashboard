@@ -1,5 +1,5 @@
 import React from 'react';
-import { Upload, AlertCircle } from 'lucide-react';
+import { Upload } from 'lucide-react';
 import './EmptyState.css';
 
 function EmptyState({ title, message, actionText, onAction }) {

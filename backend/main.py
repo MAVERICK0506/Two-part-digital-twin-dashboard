@@ -5,6 +5,13 @@ import json
 import subprocess
 import os
 from pathlib import Path
+import io
+import random
+from collections import defaultdict
+
+import simpy
+import scipy.stats as stats
+import pandas as pd
 
 app = FastAPI()
 
@@ -209,6 +216,208 @@ def get_validation():
             content={"error": str(e)},
             status_code=500
         )
+
+def _sample_duration(distribution, params):
+    """Sample a positive service-time duration from a configured distribution."""
+    dist_type = (distribution or "norm").lower()
+    p1 = float(params.get("p1", 5.0))
+    p2 = float(params.get("p2", 1.0))
+    p3 = float(params.get("p3", 0.0))
+
+    try:
+        if dist_type == "norm":
+            val = stats.norm.rvs(loc=p1, scale=max(0.001, p2))
+        elif dist_type == "weibull":
+            val = stats.weibull_min.rvs(max(0.01, p1), loc=0, scale=max(0.001, p2))
+        elif dist_type == "expon":
+            val = stats.expon.rvs(loc=0, scale=max(0.001, p1))
+        elif dist_type == "uniform":
+            low = min(p1, p2)
+            high = max(p1, p2)
+            val = stats.uniform.rvs(loc=low, scale=max(0.001, high - low))
+        elif dist_type == "triang":
+            minimum = p1
+            mode = p2
+            maximum = p3
+            if maximum <= minimum:
+                maximum = minimum + 0.001
+            c = min(1.0, max(0.0, (mode - minimum) / (maximum - minimum)))
+            val = stats.triang.rvs(c=c, loc=minimum, scale=maximum - minimum)
+        else:
+            val = p1
+    except Exception:
+        val = p1
+
+    return max(0.001, float(val))
+
+
+def _build_paths(nodes_by_id, outgoing, sources, sinks, job_count, max_steps=200):
+    """Create one routing path per job from source to sink based on graph edges."""
+    paths = []
+    source_list = list(sources)
+    if not source_list:
+        source_list = list(nodes_by_id.keys())
+
+    sink_set = set(sinks)
+
+    for _ in range(job_count):
+        current = random.choice(source_list)
+        route = [current]
+        steps = 0
+
+        while current not in sink_set and steps < max_steps:
+            next_nodes = outgoing.get(current, [])
+            if not next_nodes:
+                break
+            current = random.choice(next_nodes)
+            route.append(current)
+            steps += 1
+
+        paths.append(route)
+
+    return paths
+
+
+@app.post("/api/manual-simulate")
+def run_manual_simulation(payload: dict):
+    """Run user-designed plant simulation and return downloadable event-log CSV content."""
+    try:
+        plant = payload.get("plant", {})
+        nodes = plant.get("nodes", [])
+        edges = plant.get("edges", [])
+        settings = payload.get("settings", {})
+
+        if not nodes:
+            return JSONResponse(content={"error": "Plant must include at least one node."}, status_code=400)
+
+        job_count = int(settings.get("jobCount", 100))
+        job_count = max(1, min(10000, job_count))
+        interarrival = float(settings.get("interarrival", 1.0))
+        interarrival = max(0.001, interarrival)
+        seed = settings.get("seed")
+
+        if seed is not None and str(seed).strip() != "":
+            random.seed(int(seed))
+            try:
+                import numpy as np
+                np.random.seed(int(seed))
+            except Exception:
+                pass
+
+        nodes_by_id = {str(n["id"]): n for n in nodes if n.get("id")}
+        outgoing = defaultdict(list)
+        incoming_count = defaultdict(int)
+
+        for e in edges:
+            src = str(e.get("from", ""))
+            dst = str(e.get("to", ""))
+            if src in nodes_by_id and dst in nodes_by_id and src != dst:
+                outgoing[src].append(dst)
+                incoming_count[dst] += 1
+
+        sources = [
+            node_id
+            for node_id, node in nodes_by_id.items()
+            if (node.get("type") == "source") or incoming_count[node_id] == 0
+        ]
+        sinks = [
+            node_id
+            for node_id, node in nodes_by_id.items()
+            if (node.get("type") == "sink") or len(outgoing.get(node_id, [])) == 0
+        ]
+
+        paths = _build_paths(nodes_by_id, outgoing, sources, sinks, job_count)
+
+        env = simpy.Environment()
+        logs = []
+
+        station_resources = {}
+        for node_id, node in nodes_by_id.items():
+            node_type = (node.get("type") or "station").lower()
+            if node_type in {"station", "machine", "utility"}:
+                capacity = int(node.get("capacity", 1))
+                station_resources[node_id] = simpy.Resource(env, capacity=max(1, capacity))
+
+        arrival_trace = []
+        current_time = 0.0
+        for _ in range(job_count):
+            current_time += random.expovariate(1.0 / interarrival)
+            arrival_trace.append(current_time)
+
+        def process_job(job_idx, route, arrival_time):
+            yield env.timeout(arrival_time - env.now)
+            case_id = f"Job_{job_idx}"
+
+            for node_id in route:
+                node = nodes_by_id[node_id]
+                activity_name = node.get("name") or node_id
+                node_type = (node.get("type") or "station").lower()
+
+                if node_id not in station_resources:
+                    continue
+
+                logs.append({
+                    "CaseID": case_id,
+                    "Activity": activity_name,
+                    "Timestamp": round(env.now, 6),
+                    "Lifecycle": "QUEUE_ENTER",
+                })
+
+                with station_resources[node_id].request() as req:
+                    yield req
+
+                    logs.append({
+                        "CaseID": case_id,
+                        "Activity": activity_name,
+                        "Timestamp": round(env.now, 6),
+                        "Lifecycle": "START",
+                    })
+
+                    dist = (node.get("distribution") or {}).get("type", "norm")
+                    params = (node.get("distribution") or {}).get("params", {})
+                    duration = _sample_duration(dist, params)
+
+                    yield env.timeout(duration)
+
+                    logs.append({
+                        "CaseID": case_id,
+                        "Activity": activity_name,
+                        "Timestamp": round(env.now, 6),
+                        "Lifecycle": "COMPLETE",
+                    })
+
+        for i, route in enumerate(paths, start=1):
+            env.process(process_job(i, route, arrival_trace[i - 1]))
+
+        env.run()
+
+        if not logs:
+            return JSONResponse(content={"error": "No station events were produced. Add at least one machine/utility/station node."}, status_code=400)
+
+        df = pd.DataFrame(logs)
+        df = df.sort_values(by=["Timestamp", "CaseID", "Activity", "Lifecycle"]).reset_index(drop=True)
+
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False)
+        csv_text = csv_buffer.getvalue()
+
+        station_count = len(station_resources)
+        total_time = float(df["Timestamp"].max()) if not df.empty else 0.0
+
+        return JSONResponse(content={
+            "status": "success",
+            "summary": {
+                "jobs": job_count,
+                "events": int(len(df)),
+                "stations": station_count,
+                "total_time": round(total_time, 3),
+            },
+            "csv_content": csv_text,
+            "message": "Manual plant simulation completed and CSV event log generated.",
+        })
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
 
 if __name__ == "__main__":
     import uvicorn
